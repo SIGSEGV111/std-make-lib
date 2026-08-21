@@ -1,0 +1,512 @@
+# Shared GNU make infrastructure for the SIGSEGV111 C++/RPM projects.
+# Project Makefiles are expected to set their parameters before including this
+# file. Project-specific targets may be added after the include.
+
+ifndef STD_MAKE_LIB_INCLUDED
+STD_MAKE_LIB_INCLUDED := 1
+STD_MAKE_LIB_VERSION := 1.0.0
+STD_MAKEFILE := $(lastword $(MAKEFILE_LIST))
+STD_PROJECT_MAKEFILES := $(MAKEFILE_LIST)
+
+.DEFAULT_GOAL := all
+
+# -----------------------------------------------------------------------------
+# Core toolchain and paths
+# -----------------------------------------------------------------------------
+
+STD_PROFILE ?= custom
+ifeq ($(origin CXX),default)
+CXX := clang++
+endif
+ARCH ?= $(shell rpm --eval '%{_target_cpu}' 2>/dev/null || uname -m)
+GEN_DIR ?= gen
+OUT_DIR ?= $(GEN_DIR)/$(ARCH)
+RELEASE_DIR ?= $(OUT_DIR)/release
+DEBUG_DIR ?= $(OUT_DIR)/debug
+GTEST_DIR ?= $(OUT_DIR)/gtest
+CI_DIR ?= $(GEN_DIR)/jenkins
+CI_RPM_DIR ?= $(CI_DIR)/rpm
+CI_JUNIT_XML ?= $(CI_DIR)/junit.xml
+RPM_OUT_DIR ?= .
+KEYID ?= BE5096C665CA4595AF11DAB010CD9FF74E4565ED
+
+EASY_RPM ?= easy-rpm.sh
+DEPLOY_RPM ?= deploy-rpm.sh
+ENSURE_GIT_CLEAN ?= ensure-git-clean.sh
+
+CPPFLAGS ?=
+CXXFLAGS ?=
+LDFLAGS ?=
+EXEFLAGS ?=
+TEST_CXXFLAGS ?=
+TEST_GTEST_FLAGS ?=
+TEST_JUNIT_XML ?=
+
+ifneq ($(strip $(TEST_JUNIT_XML)),)
+TEST_GTEST_FLAGS += '--gtest_output=xml:$(abspath $(TEST_JUNIT_XML))'
+endif
+
+CXX_STANDARD ?= c++20
+RELEASE_CXXFLAGS ?= -O3 -g -DNDEBUG -flto
+DEBUG_CXXFLAGS ?= -O0 -g3 -fno-omit-frame-pointer
+GTEST_CXXFLAGS ?= -O0 -g3 -fno-omit-frame-pointer
+
+ifeq ($(ARCH),x86_64)
+ifeq ($(STD_ENABLE_X86_64_V2),1)
+RELEASE_CXXFLAGS += -march=x86-64-v2
+endif
+endif
+
+COMMON_CXXFLAGS ?= \
+	-Wall -Wextra \
+	-Wno-unused-command-line-argument \
+	-Wno-unused-parameter \
+	-Wno-unused-const-variable \
+	-Wno-vla-extension \
+	-Wno-deprecated-declarations \
+	-std=$(CXX_STANDARD) \
+	$(CXXFLAGS)
+COMMON_LDFLAGS ?= -fuse-ld=lld $(LDFLAGS)
+EXE_CXXFLAGS ?= -fPIE
+VERSION_CXXFLAGS ?= "-DVERSION=\"$(VERSION)\""
+PROJECT_CPPFLAGS ?=
+PROJECT_HEADERS ?=
+PACKAGE_NAMES ?=
+PACKAGE_CXXFLAGS = $(if $(strip $(PACKAGE_NAMES)),$(shell pkg-config --cflags $(PACKAGE_NAMES)))
+PACKAGE_LDLIBS = $(if $(strip $(PACKAGE_NAMES)),$(shell pkg-config --libs $(PACKAGE_NAMES)))
+
+export CXX
+
+# -----------------------------------------------------------------------------
+# Version helpers
+# -----------------------------------------------------------------------------
+
+USE_GIT_PACKAGE_VERSION ?= 0
+ifeq ($(USE_GIT_PACKAGE_VERSION),1)
+AUTOMATIC_GIT_VERSION := $(strip $(shell \
+	count="$$(git rev-list --count HEAD 2>/dev/null)" && \
+	hash="$$(git show --format=%h --no-patch HEAD 2>/dev/null)" && \
+	printf '%s.%s' "$$count" "$$hash"))
+PACKAGE_VERSION ?= $(if $(RPM_VERSION),$(RPM_VERSION),$(AUTOMATIC_GIT_VERSION))
+PACKAGE_VERSION := $(strip $(PACKAGE_VERSION))
+ifeq ($(PACKAGE_VERSION),)
+$(error unable to determine PACKAGE_VERSION; set PACKAGE_VERSION/RPM_VERSION explicitly or build inside a Git repository)
+endif
+VERSION ?= Version $(PACKAGE_VERSION)
+else
+VERSION ?= *DEVELOPMENT SNAPSHOT*
+endif
+
+# -----------------------------------------------------------------------------
+# Optional Clang lifetime diagnostics
+# -----------------------------------------------------------------------------
+
+WITH_LIFETIME_DIAGNOSTICS ?= 0
+ifeq ($(WITH_LIFETIME_DIAGNOSTICS),1)
+define clang_warning_if_supported
+$(strip $(shell printf 'int main(){}\n' | $(CXX) -x c++ -std=c++20 -fsyntax-only \
+	-Werror=unknown-warning-option $(1) - >/dev/null 2>&1 && printf '%s' '$(1)'))
+endef
+
+LIFETIME_PERMISSIVE_FLAG := $(call clang_warning_if_supported,-Wlifetime-safety-permissive)
+LIFETIME_STRICT_FLAG := $(call clang_warning_if_supported,-Wlifetime-safety-strict)
+LIFETIME_VALIDATIONS_FLAG := $(call clang_warning_if_supported,-Wlifetime-safety-validations)
+LIFETIME_SUGGESTIONS_FLAG := $(call clang_warning_if_supported,-Wlifetime-safety-suggestions)
+BASE_LIFETIME_CXXFLAGS := -Wdangling -Werror=dangling -Werror=return-stack-address
+DEBUG_LIFETIME_CXXFLAGS := $(BASE_LIFETIME_CXXFLAGS) $(LIFETIME_PERMISSIVE_FLAG)
+LIFETIME_CHECK_CXXFLAGS := \
+	$(LIFETIME_STRICT_FLAG) \
+	$(LIFETIME_VALIDATIONS_FLAG) \
+	$(LIFETIME_SUGGESTIONS_FLAG)
+endif
+
+# -----------------------------------------------------------------------------
+# el1 consumer support, including Jenkins RPM bootstrap
+# -----------------------------------------------------------------------------
+
+USE_EL1 ?= 0
+EL1_RESOLVE ?= 1
+EL1_INCLUDE ?=
+EL1_LIBDIR ?=
+EL1_INCLUDE_DIR ?= $(EL1_INCLUDE)
+EL1_LIB_DIR ?= $(EL1_LIBDIR)
+EL1_RPM_DIR ?=
+EL1_PREPARE_DIR ?= $(GEN_DIR)/el1-rpm
+EL1_PREPARE_ROOT := $(abspath $(EL1_PREPARE_DIR))
+EL1_PREPARED_INCLUDE_DIR := $(EL1_PREPARE_ROOT)$(shell rpm --eval '%{_includedir}' 2>/dev/null || printf '/usr/include')
+EL1_PREPARED_LIB_DIR := $(EL1_PREPARE_ROOT)$(shell rpm --eval '%{_libdir}' 2>/dev/null || printf '/usr/lib')
+EL1_RPM_BOOTSTRAP := $(and $(strip $(EL1_RPM_DIR)),$(filter ci prepare-el1-dirs,$(MAKECMDGOALS)))
+EL1_BUILD_DEPS :=
+EL1_CPPFLAGS :=
+EL1_LDFLAGS :=
+EL1_LDLIBS :=
+EL1_RUN_ENV :=
+
+ifeq ($(USE_EL1),1)
+.PHONY: prepare-el1-dirs FORCE
+
+prepare-el1-dirs:
+	@set -eu; \
+	if [ -z "$(strip $(EL1_RPM_DIR))" ]; then \
+		echo "ERROR: EL1_RPM_DIR must point to the directory containing the el1 RPM artifacts" >&2; \
+		exit 1; \
+	fi; \
+	for tool in rpm rpm2cpio cpio; do \
+		command -v "$$tool" >/dev/null 2>&1 || { echo "ERROR: required tool '$$tool' not found" >&2; exit 1; }; \
+	done; \
+	rpm_dir="$(abspath $(EL1_RPM_DIR))"; \
+	runtime_rpm="$$rpm_dir/el1.$(ARCH).rpm"; \
+	devel_rpm="$$rpm_dir/el1-devel.$(ARCH).rpm"; \
+	for rpm_file in "$$runtime_rpm" "$$devel_rpm"; do \
+		test -f "$$rpm_file" || { echo "ERROR: missing el1 RPM '$$rpm_file'" >&2; exit 1; }; \
+	done; \
+	test "$$(rpm -qp --queryformat '%{NAME}' "$$runtime_rpm")" = "el1" || { echo "ERROR: '$$runtime_rpm' is not the el1 runtime RPM" >&2; exit 1; }; \
+	test "$$(rpm -qp --queryformat '%{NAME}' "$$devel_rpm")" = "el1-devel" || { echo "ERROR: '$$devel_rpm' is not the el1-devel RPM" >&2; exit 1; }; \
+	runtime_version="$$(rpm -qp --queryformat '%{VERSION}' "$$runtime_rpm")"; \
+	devel_version="$$(rpm -qp --queryformat '%{VERSION}' "$$devel_rpm")"; \
+	test "$$runtime_version" = "$$devel_version" || { echo "ERROR: el1 RPM version mismatch: runtime=$$runtime_version devel=$$devel_version" >&2; exit 1; }; \
+	rm -rf -- "$(EL1_PREPARE_ROOT)"; \
+	mkdir -p -- "$(EL1_PREPARE_ROOT)"; \
+	(cd "$(EL1_PREPARE_ROOT)" && rpm2cpio "$$runtime_rpm" | cpio -idm --quiet); \
+	(cd "$(EL1_PREPARE_ROOT)" && rpm2cpio "$$devel_rpm" | cpio -idm --quiet); \
+	test -f "$(EL1_PREPARED_INCLUDE_DIR)/el1/el1.hpp" || { echo "ERROR: prepared el1 headers are incomplete" >&2; exit 1; }; \
+	test -e "$(EL1_PREPARED_LIB_DIR)/libel1.so" || { echo "ERROR: prepared el1 library is incomplete" >&2; exit 1; }; \
+	printf 'Prepared el1 %s: include=%s lib=%s\n' "$$runtime_version" "$(EL1_PREPARED_INCLUDE_DIR)" "$(EL1_PREPARED_LIB_DIR)"
+
+ifeq ($(EL1_RESOLVE),1)
+ifeq ($(EL1_RPM_BOOTSTRAP),)
+ifneq ($(strip $(EL1_INCLUDE_DIR)$(EL1_LIB_DIR)),)
+ifeq ($(strip $(EL1_INCLUDE_DIR)),)
+$(error EL1_INCLUDE_DIR must be set together with EL1_LIB_DIR)
+endif
+ifeq ($(strip $(EL1_LIB_DIR)),)
+$(error EL1_LIB_DIR must be set together with EL1_INCLUDE_DIR)
+endif
+ifeq ($(wildcard $(EL1_INCLUDE_DIR)/el1/el1.hpp),)
+$(error EL1_INCLUDE_DIR='$(EL1_INCLUDE_DIR)' does not contain el1/el1.hpp)
+endif
+ifeq ($(wildcard $(EL1_LIB_DIR)/libel1.so),)
+$(error EL1_LIB_DIR='$(EL1_LIB_DIR)' does not contain libel1.so)
+endif
+endif
+
+EL1_READELF := $(shell command -v readelf 2>/dev/null || command -v llvm-readelf 2>/dev/null)
+ifneq ($(strip $(EL1_LIB_DIR)),)
+EL1_DETECTED_VERSION := $(strip $(shell \
+	if [ -n "$(EL1_READELF)" ]; then \
+		"$(EL1_READELF)" -d "$(EL1_LIB_DIR)/libel1.so" 2>/dev/null | \
+			sed -n 's/.*SONAME.*\[libel1\.so\.\([^]]*\)\].*/\1/p' | head -n1; \
+	elif [ -L "$(EL1_LIB_DIR)/libel1.so" ]; then \
+		basename "$$(readlink "$(EL1_LIB_DIR)/libel1.so")" | sed 's/^libel1\.so\.//'; \
+	fi))
+else
+EL1_DETECTED_VERSION := $(strip $(shell pkg-config --modversion el1 2>/dev/null))
+endif
+ifeq ($(strip $(EL1_DETECTED_VERSION)),)
+$(error unable to determine el1 version; build el1 first or install an el1-devel package providing el1.pc)
+endif
+override EL1_VERSION := $(EL1_DETECTED_VERSION)
+
+ifneq ($(strip $(EL1_LIB_DIR)),)
+EL1_LIBRARY_LINK := $(EL1_LIB_DIR)/libel1.so
+else
+EL1_SYSTEM_LIB_DIR := $(strip $(shell pkg-config --variable=libdir el1 2>/dev/null))
+EL1_LIBRARY_LINK := $(EL1_SYSTEM_LIB_DIR)/libel1.so
+endif
+EL1_LIBRARY_FILE := $(realpath $(EL1_LIBRARY_LINK))
+ifeq ($(strip $(EL1_LIBRARY_FILE)),)
+$(error unable to resolve selected el1 library '$(EL1_LIBRARY_LINK)')
+endif
+endif
+
+EL1_CPPFLAGS := $(if $(EL1_INCLUDE_DIR),-I$(EL1_INCLUDE_DIR))
+EL1_LDFLAGS := $(if $(EL1_LIB_DIR),-L$(EL1_LIB_DIR))
+EL1_LDLIBS := -lel1
+ifneq ($(EL1_LIB_DIR),)
+EL1_RUN_ENV := LD_LIBRARY_PATH="$(EL1_LIB_DIR)$${LD_LIBRARY_PATH:+:$${LD_LIBRARY_PATH}}"
+endif
+
+EL1_CONFIG_STAMP ?= $(OUT_DIR)/.el1-config
+EL1_CONFIG_KEY := $(EL1_INCLUDE_DIR)|$(EL1_LIB_DIR)|$(EL1_VERSION)|$(EL1_LIBRARY_FILE)
+EL1_PREVIOUS_CONFIG := $(strip $(shell cat "$(EL1_CONFIG_STAMP)" 2>/dev/null))
+ifneq ($(EL1_PREVIOUS_CONFIG),$(EL1_CONFIG_KEY))
+EL1_REBUILD_TRIGGER := FORCE
+else
+EL1_REBUILD_TRIGGER :=
+endif
+EL1_BUILD_DEPS := $(EL1_CONFIG_STAMP) $(EL1_REBUILD_TRIGGER) $(EL1_LIBRARY_FILE)
+
+FORCE:
+
+$(EL1_CONFIG_STAMP): FORCE
+	@mkdir -p "$(@D)"
+	@printf '%s\n' '$(EL1_CONFIG_KEY)' > "$@.tmp"
+	@if test -f "$@" && cmp -s "$@.tmp" "$@"; then rm -f "$@.tmp"; else mv -f "$@.tmp" "$@"; fi
+
+export EL1_INCLUDE_DIR EL1_LIB_DIR EL1_VERSION
+endif
+endif
+
+# -----------------------------------------------------------------------------
+# GoogleTest support
+# -----------------------------------------------------------------------------
+
+WITH_GTEST ?= 0
+GTEST_SOURCE_DIR ?= submodules/googletest
+GTEST_LIB ?= $(GTEST_DIR)/lib/libgtest.a
+GTEST_MAIN_LIB ?= $(GTEST_DIR)/lib/libgtest_main.a
+GTEST_INCLUDE ?= -I$(GTEST_SOURCE_DIR)/googletest/include
+GTEST_BUILD_CXXFLAGS ?= \
+	-Wno-unused-command-line-argument \
+	-fuse-ld=lld \
+	-fPIC \
+	$(CXXFLAGS) \
+	$(GTEST_CXXFLAGS)
+
+ifeq ($(WITH_GTEST),1)
+$(GTEST_LIB): $(STD_PROJECT_MAKEFILES)
+	@mkdir -p "$(GTEST_DIR)"
+	(P="$$PWD"; cd "$(GTEST_DIR)" && \
+		cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="$(GTEST_BUILD_CXXFLAGS)" "$$P/$(GTEST_SOURCE_DIR)" && \
+		$(MAKE))
+
+$(GTEST_MAIN_LIB): $(GTEST_LIB)
+	@test -f "$@"
+endif
+
+# -----------------------------------------------------------------------------
+# Generic C++ application profile
+# -----------------------------------------------------------------------------
+
+ifeq ($(STD_PROFILE),cxx-apps)
+PROGRAM_IDS ?= MAIN
+TEST_IDS ?=
+PROGRAM_LINK_COMMON ?= $(EL1_LDLIBS) $(PACKAGE_LDLIBS) $(EXEFLAGS)
+TEST_LINK_COMMON ?= $(EL1_LDLIBS) $(PACKAGE_LDLIBS) $(EXEFLAGS)
+RUN_ENV ?= $(EL1_RUN_ENV)
+
+std_program_release_file = $(RELEASE_DIR)/$(PROGRAM_$(1)_NAME)
+std_program_debug_file = $(DEBUG_DIR)/$(PROGRAM_$(1)_NAME)
+std_program_release_objects = $(patsubst %.cpp,$(RELEASE_DIR)/obj/$(1)/%.o,$(PROGRAM_$(1)_SOURCES))
+std_program_debug_objects = $(patsubst %.cpp,$(DEBUG_DIR)/obj/$(1)/%.o,$(PROGRAM_$(1)_SOURCES))
+std_test_release_file = $(RELEASE_DIR)/$(TEST_$(1)_NAME)
+std_test_debug_file = $(DEBUG_DIR)/$(TEST_$(1)_NAME)
+std_test_release_objects = $(patsubst %.cpp,$(RELEASE_DIR)/test/$(1)/%.o,$(TEST_$(1)_SOURCES))
+std_test_debug_objects = $(patsubst %.cpp,$(DEBUG_DIR)/test/$(1)/%.o,$(TEST_$(1)_SOURCES))
+
+.PHONY: all release debug build-tests-release build-tests-debug test test-release test-debug clean
+all: release debug
+release:
+debug:
+build-tests-release:
+build-tests-debug:
+
+# Each program gets private objects. This intentionally favors predictable,
+# parameter-only project Makefiles over clever object sharing between binaries.
+define std_define_program
+PROGRAM_$(1)_RELEASE_FILE := $$(call std_program_release_file,$(1))
+PROGRAM_$(1)_DEBUG_FILE := $$(call std_program_debug_file,$(1))
+PROGRAM_$(1)_RELEASE_OBJECTS := $$(call std_program_release_objects,$(1))
+PROGRAM_$(1)_DEBUG_OBJECTS := $$(call std_program_debug_objects,$(1))
+
+release: $$(PROGRAM_$(1)_RELEASE_FILE)
+debug: $$(PROGRAM_$(1)_DEBUG_FILE)
+
+$$(RELEASE_DIR)/obj/$(1)/%.o: %.cpp $$(PROJECT_HEADERS) $$(STD_PROJECT_MAKEFILES) $$(EL1_BUILD_DEPS)
+	@mkdir -p "$$(@D)"
+	$$(CXX) $$(PROJECT_CPPFLAGS) $$(EL1_CPPFLAGS) $$(CPPFLAGS) $$(PROGRAM_$(1)_CPPFLAGS) \
+		$$(COMMON_CXXFLAGS) $$(RELEASE_CXXFLAGS) $$(EXE_CXXFLAGS) $$(PACKAGE_CXXFLAGS) \
+		$$(VERSION_CXXFLAGS) $$(PROGRAM_$(1)_CXXFLAGS) -MMD -MP -c -o "$$@" "$$<"
+
+$$(DEBUG_DIR)/obj/$(1)/%.o: %.cpp $$(PROJECT_HEADERS) $$(STD_PROJECT_MAKEFILES) $$(EL1_BUILD_DEPS)
+	@mkdir -p "$$(@D)"
+	$$(CXX) $$(PROJECT_CPPFLAGS) $$(EL1_CPPFLAGS) $$(CPPFLAGS) $$(PROGRAM_$(1)_CPPFLAGS) \
+		$$(COMMON_CXXFLAGS) $$(DEBUG_CXXFLAGS) $$(EXE_CXXFLAGS) $$(PACKAGE_CXXFLAGS) \
+		$$(VERSION_CXXFLAGS) $$(PROGRAM_$(1)_CXXFLAGS) -MMD -MP -c -o "$$@" "$$<"
+
+$$(PROGRAM_$(1)_RELEASE_FILE): $$(PROGRAM_$(1)_RELEASE_OBJECTS) $$(EL1_LIBRARY_FILE)
+	@mkdir -p "$$(@D)"
+	$$(CXX) $$(EL1_LDFLAGS) $$(COMMON_LDFLAGS) $$(RELEASE_CXXFLAGS) $$(EXE_CXXFLAGS) \
+		$$(PROGRAM_$(1)_LDFLAGS) -o "$$@" $$(PROGRAM_$(1)_RELEASE_OBJECTS) \
+		$$(PROGRAM_LINK_COMMON) $$(PROGRAM_$(1)_LDLIBS)
+	$$(if $$(strip $$(PROGRAM_$(1)_VERIFY_ARGS)),$$(RUN_ENV) "$$@" $$(PROGRAM_$(1)_VERIFY_ARGS),@:)
+
+$$(PROGRAM_$(1)_DEBUG_FILE): $$(PROGRAM_$(1)_DEBUG_OBJECTS) $$(EL1_LIBRARY_FILE)
+	@mkdir -p "$$(@D)"
+	$$(CXX) $$(EL1_LDFLAGS) $$(COMMON_LDFLAGS) $$(DEBUG_CXXFLAGS) $$(EXE_CXXFLAGS) \
+		$$(PROGRAM_$(1)_LDFLAGS) -o "$$@" $$(PROGRAM_$(1)_DEBUG_OBJECTS) \
+		$$(PROGRAM_LINK_COMMON) $$(PROGRAM_$(1)_LDLIBS)
+	$$(if $$(strip $$(PROGRAM_$(1)_VERIFY_ARGS)),$$(RUN_ENV) "$$@" $$(PROGRAM_$(1)_VERIFY_ARGS),@:)
+
+STD_DEP_FILES += $$(PROGRAM_$(1)_RELEASE_OBJECTS:.o=.d) $$(PROGRAM_$(1)_DEBUG_OBJECTS:.o=.d)
+endef
+$(foreach id,$(PROGRAM_IDS),$(eval $(call std_define_program,$(id))))
+
+define std_define_test
+TEST_$(1)_RELEASE_FILE := $$(call std_test_release_file,$(1))
+TEST_$(1)_DEBUG_FILE := $$(call std_test_debug_file,$(1))
+TEST_$(1)_RELEASE_OBJECTS := $$(call std_test_release_objects,$(1))
+TEST_$(1)_DEBUG_OBJECTS := $$(call std_test_debug_objects,$(1))
+TEST_$(1)_GTEST_CPPFLAGS = $$(if $$(filter 1,$$(TEST_$(1)_USE_GTEST)),$$(GTEST_INCLUDE))
+TEST_$(1)_GTEST_LDLIBS = $$(if $$(filter 1,$$(TEST_$(1)_USE_GTEST)),$$(GTEST_MAIN_LIB) $$(GTEST_LIB) -pthread)
+TEST_$(1)_GTEST_DEPS = $$(if $$(filter 1,$$(TEST_$(1)_USE_GTEST)),$$(GTEST_LIB) $$(GTEST_MAIN_LIB))
+
+build-tests-release: $$(TEST_$(1)_RELEASE_FILE)
+build-tests-debug: $$(TEST_$(1)_DEBUG_FILE)
+
+$$(RELEASE_DIR)/test/$(1)/%.o: %.cpp $$(PROJECT_HEADERS) $$(STD_PROJECT_MAKEFILES) $$(EL1_BUILD_DEPS)
+	@mkdir -p "$$(@D)"
+	$$(CXX) $$(PROJECT_CPPFLAGS) $$(EL1_CPPFLAGS) $$(CPPFLAGS) $$(TEST_$(1)_CPPFLAGS) \
+		$$(COMMON_CXXFLAGS) $$(RELEASE_CXXFLAGS) $$(TEST_CXXFLAGS) $$(EXE_CXXFLAGS) \
+		$$(PACKAGE_CXXFLAGS) $$(VERSION_CXXFLAGS) $$(TEST_$(1)_GTEST_CPPFLAGS) \
+		$$(TEST_$(1)_CXXFLAGS) -MMD -MP -c -o "$$@" "$$<"
+
+$$(DEBUG_DIR)/test/$(1)/%.o: %.cpp $$(PROJECT_HEADERS) $$(STD_PROJECT_MAKEFILES) $$(EL1_BUILD_DEPS)
+	@mkdir -p "$$(@D)"
+	$$(CXX) $$(PROJECT_CPPFLAGS) $$(EL1_CPPFLAGS) $$(CPPFLAGS) $$(TEST_$(1)_CPPFLAGS) \
+		$$(COMMON_CXXFLAGS) $$(DEBUG_CXXFLAGS) $$(TEST_CXXFLAGS) $$(EXE_CXXFLAGS) \
+		$$(PACKAGE_CXXFLAGS) $$(VERSION_CXXFLAGS) $$(TEST_$(1)_GTEST_CPPFLAGS) \
+		$$(TEST_$(1)_CXXFLAGS) -MMD -MP -c -o "$$@" "$$<"
+
+$$(TEST_$(1)_RELEASE_FILE): $$(TEST_$(1)_RELEASE_OBJECTS) $$(TEST_$(1)_GTEST_DEPS) $$(EL1_LIBRARY_FILE)
+	@mkdir -p "$$(@D)"
+	$$(CXX) $$(EL1_LDFLAGS) $$(COMMON_LDFLAGS) $$(RELEASE_CXXFLAGS) $$(EXE_CXXFLAGS) \
+		$$(TEST_$(1)_LDFLAGS) -o "$$@" $$(filter-out $$(EL1_LIBRARY_FILE) $$(GTEST_LIB) $$(GTEST_MAIN_LIB),$$^) \
+		$$(TEST_LINK_COMMON) $$(TEST_$(1)_GTEST_LDLIBS) $$(TEST_$(1)_LDLIBS)
+
+$$(TEST_$(1)_DEBUG_FILE): $$(TEST_$(1)_DEBUG_OBJECTS) $$(TEST_$(1)_GTEST_DEPS) $$(EL1_LIBRARY_FILE)
+	@mkdir -p "$$(@D)"
+	$$(CXX) $$(EL1_LDFLAGS) $$(COMMON_LDFLAGS) $$(DEBUG_CXXFLAGS) $$(EXE_CXXFLAGS) \
+		$$(TEST_$(1)_LDFLAGS) -o "$$@" $$(filter-out $$(EL1_LIBRARY_FILE) $$(GTEST_LIB) $$(GTEST_MAIN_LIB),$$^) \
+		$$(TEST_LINK_COMMON) $$(TEST_$(1)_GTEST_LDLIBS) $$(TEST_$(1)_LDLIBS)
+
+STD_DEP_FILES += $$(TEST_$(1)_RELEASE_OBJECTS:.o=.d) $$(TEST_$(1)_DEBUG_OBJECTS:.o=.d)
+endef
+$(foreach id,$(TEST_IDS),$(eval $(call std_define_test,$(id))))
+
+TEST_RELEASE_EXTRA_TARGET ?=
+TEST_DEBUG_EXTRA_TARGET ?=
+
+ifneq ($(strip $(TEST_IDS)),)
+test:
+	$(MAKE) --no-print-directory test-release
+	$(MAKE) --no-print-directory test-debug
+
+test-release: release build-tests-release $(TEST_RELEASE_EXTRA_TARGET)
+	@set -e; $(foreach id,$(TEST_IDS),$(RUN_ENV) $(TEST_RUNNER) "$(TEST_$(id)_RELEASE_FILE)" $(TEST_$(id)_ARGS);)
+
+test-debug: debug build-tests-debug $(TEST_DEBUG_EXTRA_TARGET)
+	@set -e; $(foreach id,$(TEST_IDS),$(RUN_ENV) $(TEST_RUNNER) "$(TEST_$(id)_DEBUG_FILE)" $(TEST_$(id)_ARGS);)
+endif
+
+clean:
+	rm -rf -- "$(OUT_DIR)"
+endif
+
+# -----------------------------------------------------------------------------
+# RPM packaging, deployment and generic CI
+# -----------------------------------------------------------------------------
+
+RPM_PACKAGE_IDS ?=
+std_path_join = $(if $(filter .,$(strip $(1))),$(2),$(strip $(1))/$(2))
+
+define std_define_rpm_package
+RPM_$(1)_ARCH ?= $$(ARCH)
+RPM_$(1)_SPEC ?= $$(RPM_$(1)_NAME).spec
+RPM_$(1)_OUT_DIR ?= $$(RPM_OUT_DIR)
+RPM_$(1)_ARCH_FILE ?= $$(call std_path_join,$$(RPM_$(1)_OUT_DIR),$$(RPM_$(1)_NAME).$$(RPM_$(1)_ARCH).rpm)
+RPM_$(1)_SRC_FILE ?= $$(call std_path_join,$$(RPM_$(1)_OUT_DIR),$$(basename $$(notdir $$(RPM_$(1)_SPEC))).src.rpm)
+RPM_ARTIFACTS += $$(RPM_$(1)_ARCH_FILE) $$(RPM_$(1)_SRC_FILE)
+
+$$(RPM_$(1)_ARCH_FILE) $$(RPM_$(1)_SRC_FILE) &: $$(RPM_$(1)_BUILD_DEPS) $$(RPM_$(1)_SOURCE_FILES) $$(STD_PROJECT_MAKEFILES)
+	@mkdir -p "$$(RPM_$(1)_OUT_DIR)"
+	$$(if $$(filter 1,$$(RPM_$(1)_REQUIRE_CLEAN)),$$(ENSURE_GIT_CLEAN),@:)
+	$$(RPM_$(1)_EASY_RPM) \
+		$$(RPM_$(1)_EASY_RPM_FLAGS) \
+		--name "$$(RPM_$(1)_NAME)" \
+		$$(if $$(strip $$(RPM_$(1)_VERSION)),--version "$$(RPM_$(1)_VERSION)") \
+		$$(if $$(strip $$(RPM_$(1)_SPEC)),--spec "$$(RPM_$(1)_SPEC)") \
+		--outdir "$$(RPM_$(1)_OUT_DIR)" \
+		--plain \
+		--arch "$$(RPM_$(1)_ARCH)" \
+		$$(foreach definition,$$(RPM_$(1)_DEFINES),--define "$$(definition)") \
+		-- $$(RPM_$(1)_SOURCE_FILES) $$(STD_PROJECT_MAKEFILES)
+endef
+
+$(foreach id,$(RPM_PACKAGE_IDS),$(eval RPM_$(id)_EASY_RPM ?= $(EASY_RPM)))
+$(foreach id,$(RPM_PACKAGE_IDS),$(eval $(call std_define_rpm_package,$(id))))
+
+ifneq ($(strip $(RPM_PACKAGE_IDS)),)
+.PHONY: package rpm deploy
+package: rpm
+rpm: $(RPM_ARTIFACTS)
+
+deploy: rpm
+	$(ENSURE_GIT_CLEAN)
+	@set -e; for rpm_file in $(RPM_ARTIFACTS); do \
+		$(DEPLOY_RPM) --infile="$$rpm_file" --outdir="$(RPMDIR)" --keyid="$(KEYID)"; \
+	done
+endif
+
+CI_ENABLE ?= 0
+CI_TEST_TARGET ?= $(if $(strip $(TEST_IDS)),test,)
+CI_TEST_MAKE_ARGS ?= $(if $(filter 1,$(WITH_GTEST)),TEST_JUNIT_XML="$(abspath $(CI_JUNIT_XML))",)
+CI_RPM_ARTIFACTS ?= $(RPM_ARTIFACTS)
+
+ifeq ($(CI_ENABLE),1)
+.PHONY: ci
+ci:
+	rm -rf -- "$(CI_DIR)"
+	mkdir -p -- "$(CI_RPM_DIR)"
+ifneq ($(strip $(EL1_RPM_DIR)),)
+	$(MAKE) --no-print-directory prepare-el1-dirs
+ifneq ($(strip $(CI_TEST_TARGET)),)
+	$(MAKE) --no-print-directory $(CI_TEST_TARGET) EL1_RPM_DIR= EL1_INCLUDE_DIR="$(EL1_PREPARED_INCLUDE_DIR)" EL1_LIB_DIR="$(EL1_PREPARED_LIB_DIR)" $(CI_TEST_MAKE_ARGS)
+endif
+	$(MAKE) --no-print-directory rpm EL1_RPM_DIR= EL1_INCLUDE_DIR="$(EL1_PREPARED_INCLUDE_DIR)" EL1_LIB_DIR="$(EL1_PREPARED_LIB_DIR)"
+else
+ifneq ($(strip $(CI_TEST_TARGET)),)
+	$(MAKE) --no-print-directory $(CI_TEST_TARGET) $(CI_TEST_MAKE_ARGS)
+endif
+	$(MAKE) --no-print-directory rpm
+endif
+	cp -f -- $(CI_RPM_ARTIFACTS) "$(CI_RPM_DIR)/"
+ifneq ($(strip $(CI_TEST_TARGET)),)
+ifeq ($(WITH_GTEST),1)
+	@printf 'JUnit report: %s\n' "$(abspath $(CI_JUNIT_XML))"
+endif
+endif
+	@printf 'RPM artifacts: %s\n' "$(abspath $(CI_RPM_DIR))"
+endif
+
+# -----------------------------------------------------------------------------
+# Top-level subdirectory orchestration profile (SPIhome)
+# -----------------------------------------------------------------------------
+
+ifeq ($(STD_PROFILE),subdirs)
+.PHONY: all clean install rpm deploy ci
+SUBDIR_TARGETS ?= all clean install rpm deploy
+
+all clean install rpm deploy:
+	@set -e; for dir in $(SUBDIRS); do \
+		$(MAKE) -C "$$dir" $@; \
+	done
+
+ci:
+	rm -rf -- "$(CI_DIR)"
+	mkdir -p -- "$(CI_RPM_DIR)"
+ifneq ($(strip $(EL1_RPM_DIR)),)
+	$(MAKE) --no-print-directory prepare-el1-dirs
+	$(MAKE) --no-print-directory rpm EL1_RPM_DIR= EL1_INCLUDE_DIR="$(EL1_PREPARED_INCLUDE_DIR)" EL1_LIB_DIR="$(EL1_PREPARED_LIB_DIR)"
+else
+	$(MAKE) --no-print-directory rpm
+endif
+	@set -e; for dir in $(SUBDIRS); do \
+		cp -f -- "$$dir"/*.rpm "$(CI_RPM_DIR)/"; \
+	done
+	@printf 'RPM artifacts: %s\n' "$(abspath $(CI_RPM_DIR))"
+endif
+
+-include $(STD_DEP_FILES)
+
+endif
