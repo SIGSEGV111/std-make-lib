@@ -135,7 +135,8 @@ EL1_PREPARE_DIR ?= $(GEN_DIR)/el1-rpm
 EL1_PREPARE_ROOT := $(abspath $(EL1_PREPARE_DIR))
 EL1_PREPARED_INCLUDE_DIR := $(EL1_PREPARE_ROOT)$(shell rpm --eval '%{_includedir}' 2>/dev/null || printf '/usr/include')
 EL1_PREPARED_LIB_DIR := $(EL1_PREPARE_ROOT)$(shell rpm --eval '%{_libdir}' 2>/dev/null || printf '/usr/lib')
-EL1_RPM_BOOTSTRAP := $(and $(strip $(EL1_RPM_DIR)),$(filter ci prepare-el1-dirs,$(MAKECMDGOALS)))
+EL1_BOOTSTRAP_ENABLED := $(and $(filter 1,$(USE_EL1)),$(strip $(EL1_RPM_DIR)))
+EL1_RPM_BOOTSTRAP := $(and $(EL1_BOOTSTRAP_ENABLED),$(filter ci prepare-el1-dirs,$(MAKECMDGOALS)))
 EL1_BUILD_DEPS :=
 EL1_CPPFLAGS :=
 EL1_LDFLAGS :=
@@ -458,7 +459,7 @@ ifeq ($(CI_ENABLE),1)
 ci:
 	rm -rf -- "$(CI_DIR)"
 	mkdir -p -- "$(CI_RPM_DIR)"
-ifneq ($(strip $(EL1_RPM_DIR)),)
+ifneq ($(EL1_BOOTSTRAP_ENABLED),)
 	$(MAKE) --no-print-directory prepare-el1-dirs
 ifneq ($(strip $(CI_TEST_TARGET)),)
 	$(MAKE) --no-print-directory $(CI_TEST_TARGET) EL1_RPM_DIR= EL1_INCLUDE_DIR="$(EL1_PREPARED_INCLUDE_DIR)" EL1_LIB_DIR="$(EL1_PREPARED_LIB_DIR)" $(CI_TEST_MAKE_ARGS)
@@ -495,7 +496,7 @@ all clean install rpm deploy:
 ci:
 	rm -rf -- "$(CI_DIR)"
 	mkdir -p -- "$(CI_RPM_DIR)"
-ifneq ($(strip $(EL1_RPM_DIR)),)
+ifneq ($(EL1_BOOTSTRAP_ENABLED),)
 	$(MAKE) --no-print-directory prepare-el1-dirs
 	$(MAKE) --no-print-directory rpm EL1_RPM_DIR= EL1_INCLUDE_DIR="$(EL1_PREPARED_INCLUDE_DIR)" EL1_LIB_DIR="$(EL1_PREPARED_LIB_DIR)"
 else
