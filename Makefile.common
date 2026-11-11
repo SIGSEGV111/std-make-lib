@@ -394,10 +394,10 @@ test:
 	$(MAKE) --no-print-directory test-debug
 
 test-release: release build-tests-release $(TEST_RELEASE_EXTRA_TARGET)
-	@set -e; $(foreach id,$(TEST_IDS),$(RUN_ENV) $(TEST_RUNNER) "$(TEST_$(id)_RELEASE_FILE)" $(TEST_$(id)_ARGS);)
+	set -e; $(foreach id,$(TEST_IDS),$(RUN_ENV) $(TEST_RUNNER) "$(TEST_$(id)_RELEASE_FILE)" $(TEST_$(id)_ARGS);)
 
 test-debug: debug build-tests-debug $(TEST_DEBUG_EXTRA_TARGET)
-	@set -e; $(foreach id,$(TEST_IDS),$(RUN_ENV) $(TEST_RUNNER) "$(TEST_$(id)_DEBUG_FILE)" $(TEST_$(id)_ARGS);)
+	set -e; $(foreach id,$(TEST_IDS),$(RUN_ENV) $(TEST_RUNNER) "$(TEST_$(id)_DEBUG_FILE)" $(TEST_$(id)_ARGS);)
 endif
 
 clean:
